@@ -1,0 +1,9 @@
+datasets/train/*
+datasets/val/*
+datasets/plot_test/*
+lightning_logs/*
+
+# Python cache directories and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
