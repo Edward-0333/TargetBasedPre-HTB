@@ -26,6 +26,7 @@ from models import LocalEncoder
 from models import MLPDecoder
 from utils import TemporalData
 from models import MapEncoder
+from models import LinearScorerLayer
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -89,6 +90,8 @@ class HiVT(pl.LightningModule):
             polygon_channel=4,
             use_lane_boundary=True,
         )
+        self.linear_scorer_layer = LinearScorerLayer(T=30, d=256)
+
         self.minADE = ADE()
         self.minFDE = FDE()
         self.minMR = MR()
@@ -125,50 +128,81 @@ class HiVT(pl.LightningModule):
             split_sizes = split_sizes.tolist()
             global_embed_batch = global_embed.split(split_sizes, dim=0)
             padding_mask_batch = data['padding_mask'].split(split_sizes, dim=0)
-            global_embed_batch = pad_sequence(global_embed_batch, batch_first=True)
-            padding_mask_batch = pad_sequence(padding_mask_batch, batch_first=True)
-        test5 = padding_mask_batch[1].cpu().numpy()
+            global_embed_batch = pad_sequence(global_embed_batch, batch_first=True, padding_value=0.0)
+            padding_mask_batch = pad_sequence(padding_mask_batch, batch_first=True, padding_value=True)
         lane_features, valid_mask = self.map_encoder(data=data)
+        map_key_padding = ~valid_mask.any(-1)
 
-        y_hat, pi = self.decoder(local_embed=local_embed, global_embed=global_embed)
-        return y_hat, pi
+        logits, probs = self.linear_scorer_layer(
+            global_embed_batch,
+            lane_features,
+            agent_mask=padding_mask_batch[:,:,self.historical_steps:],
+            lane_mask=map_key_padding,
+        )
+
+        # y_hat, pi = self.decoder(local_embed=local_embed, global_embed=global_embed)
+        return logits, probs
 
     def training_step(self, data, batch_idx):
-        y_hat, pi = self(data)
-        reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-        valid_steps = reg_mask.sum(dim=-1)
-        cls_mask = valid_steps > 0
-        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
-        best_mode = l2_norm.argmin(dim=0)
-        y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
-        reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-        soft_target = F.softmax(-l2_norm[:, cls_mask] / valid_steps[cls_mask], dim=0).t().detach()
-        cls_loss = self.cls_loss(pi[cls_mask], soft_target)
-        loss = reg_loss + cls_loss
-        self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        logits, probs = self(data)
+        target_lane_id = data['agent_lane_id_target'][:, self.historical_steps:].long()
+        batch = data.batch
+        batch_size = int(data.num_graphs)
+        split_sizes = torch.bincount(batch, minlength=batch_size)
+        if split_sizes.device.type != 'cpu':
+            split_sizes = split_sizes.cpu()
+        split_sizes = split_sizes.tolist()
+        target_lane_id = target_lane_id.split(split_sizes, dim=0)
+        target_lane_id = pad_sequence(target_lane_id, batch_first=True, padding_value=-1)
+        ignore_index = -100
+        target_lane_id = target_lane_id.masked_fill(target_lane_id == -1, ignore_index)
+
+        agent_mask = data['padding_mask'][:, self.historical_steps:]
+        agent_mask = agent_mask.split(split_sizes, dim=0)
+        agent_mask = pad_sequence(agent_mask, batch_first=True, padding_value=True)
+        B, N, T, K = probs.shape
+        loss = F.cross_entropy(
+            logits.view(-1, K),
+            target_lane_id.view(-1),
+            reduction='none',
+            ignore_index=ignore_index
+        ).view(B, N, T)
+        valid = torch.ones_like(loss, dtype=torch.float, device=loss.device)
+        if agent_mask is not None:
+            valid = valid * (~agent_mask).float()
+        loss = (loss * valid).sum() / valid.sum()
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
         return loss
 
     def validation_step(self, data, batch_idx):
-        y_hat, pi = self(data)
-        reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-        test = data.y.cpu().numpy()
-        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
-        best_mode = l2_norm.argmin(dim=0)
-        y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
-        reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-        self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        logits, probs = self(data)
+        target_lane_id = data['agent_lane_id_target'][:, self.historical_steps:].long()
+        batch = data.batch
+        batch_size = int(data.num_graphs)
+        split_sizes = torch.bincount(batch, minlength=batch_size)
+        if split_sizes.device.type != 'cpu':
+            split_sizes = split_sizes.cpu()
+        split_sizes = split_sizes.tolist()
+        target_lane_id = target_lane_id.split(split_sizes, dim=0)
+        target_lane_id = pad_sequence(target_lane_id, batch_first=True, padding_value=-1)
+        ignore_index = -100
+        target_lane_id = target_lane_id.masked_fill(target_lane_id == -1, ignore_index)
 
-        y_hat_agent = y_hat[:, data['agent_index'], :, : 2]
-        y_agent = data.y[data['agent_index']]
-        fde_agent = torch.norm(y_hat_agent[:, :, -1] - y_agent[:, -1], p=2, dim=-1)
-        best_mode_agent = fde_agent.argmin(dim=0)
-        y_hat_best_agent = y_hat_agent[best_mode_agent, torch.arange(data.num_graphs)]
-        self.minADE.update(y_hat_best_agent, y_agent)
-        self.minFDE.update(y_hat_best_agent, y_agent)
-        self.minMR.update(y_hat_best_agent, y_agent)
-        self.log('val_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
-        self.log('val_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
-        self.log('val_minMR', self.minMR, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
+        agent_mask = data['padding_mask'][:, self.historical_steps:]
+        agent_mask = agent_mask.split(split_sizes, dim=0)
+        agent_mask = pad_sequence(agent_mask, batch_first=True, padding_value=True)
+        B, N, T, K = probs.shape
+        loss = F.cross_entropy(
+            logits.view(-1, K),
+            target_lane_id.view(-1),
+            reduction='none',
+            ignore_index=ignore_index
+        ).view(B, N, T)
+        valid = torch.ones_like(loss, dtype=torch.float, device=loss.device)
+        if agent_mask is not None:
+            valid = valid * (~agent_mask).float()
+        loss = (loss * valid).sum() / valid.sum()
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
 
     def configure_optimizers(self):
         decay = set()
