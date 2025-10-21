@@ -75,7 +75,11 @@ class ArgoverseV1Dataset(Dataset):
 
     def process(self) -> None:
         am = ArgoverseMap()
-        for raw_path in tqdm(self.raw_paths):
+        raw_paths = self.raw_paths
+        processed_paths = self.processed_paths
+        for raw_path, processed_path in tqdm(zip(raw_paths, processed_paths), total=len(raw_paths)):
+            if os.path.exists(processed_path):
+                continue
             kwargs, lane_data = process_argoverse(self._split, raw_path, am, self._local_radius)
             data = TemporalData(**kwargs)
             # Attach lane-level tensors to the graph sample so that they can be
@@ -84,7 +88,7 @@ class ArgoverseV1Dataset(Dataset):
             data['q_lane_counts'] = lane_counts
             for key, value in lane_data.items():
                 data[key] = value
-            torch.save(data, os.path.join(self.processed_dir, str(kwargs['seq_id']) + '.pt'))
+            torch.save(data, processed_path)
 
     def len(self) -> int:
         return len(self._raw_file_names)
