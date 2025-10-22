@@ -15,6 +15,8 @@ from argparse import ArgumentParser
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from datetime import datetime
 
 from datamodules import ArgoverseV1DataModule
 from models.hivt import HiVT
@@ -34,11 +36,17 @@ if __name__ == '__main__':
     parser.add_argument('--max_epochs', type=int, default=64)
     parser.add_argument('--monitor', type=str, default='val_loss', choices=['val_minADE', 'val_minFDE', 'val_minMR'])
     parser.add_argument('--save_top_k', type=int, default=5)
+    parser.add_argument('--log_dir', type=str, default='lightning_logs')
+    parser.add_argument('--log_name', type=str, default=None)
     parser = HiVT.add_model_specific_args(parser)
     args = parser.parse_args()
 
+    if not args.log_name:
+        args.log_name = datetime.now().strftime('%Y%m%d-%H%M%S')
+
     model_checkpoint = ModelCheckpoint(monitor=args.monitor, save_top_k=args.save_top_k, mode='min')
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=[model_checkpoint])
+    tensorboard_logger = TensorBoardLogger(save_dir=args.log_dir, name=args.log_name)
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=[model_checkpoint], logger=tensorboard_logger)
     model = HiVT(**vars(args))
     datamodule = ArgoverseV1DataModule.from_argparse_args(args)
     trainer.fit(model, datamodule)

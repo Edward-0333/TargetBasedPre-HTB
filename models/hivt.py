@@ -204,6 +204,22 @@ class HiVT(pl.LightningModule):
         loss = (loss * valid).sum() / valid.sum()
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
 
+
+    def on_after_backward(self):
+        # Monitor gradient norm to catch exploding/vanishing gradients early.
+        grads = [
+            param.grad.detach()
+            for param in self.parameters()
+            if param.grad is not None
+        ]
+        if not grads:
+            return
+        total_norm = torch.linalg.vector_norm(
+            torch.stack([g.norm(2) for g in grads]), ord=2
+        )
+        self.log('grad_norm_l2', total_norm, on_step=True, prog_bar=False, logger=True)
+
+
     def configure_optimizers(self):
         decay = set()
         no_decay = set()
